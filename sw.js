@@ -1,30 +1,30 @@
 // Service worker powered by Workbox (Google). https://developer.chrome.com/docs/workbox/
 importScripts("https://storage.googleapis.com/workbox-cdn/releases/7.1.0/workbox-sw.js");
 const { registerRoute } = workbox.routing;
-const { CacheFirst, StaleWhileRevalidate, NetworkFirst } = workbox.strategies;
+const { CacheFirst, NetworkFirst } = workbox.strategies;
 const { ExpirationPlugin } = workbox.expiration;
 const { CacheableResponsePlugin } = workbox.cacheableResponse;
 
 workbox.core.skipWaiting();
 workbox.core.clientsClaim();
 
-// App shell (HTML + JS) — fast, fall back to cache.
+// App shell (HTML + JS): always take the current version when online, fall back to cache offline.
 registerRoute(
     ({ request }) => request.mode === "navigate" || ["script", "style", "worker"].includes(request.destination),
-    new StaleWhileRevalidate({ cacheName: "osmsg-shell" })
+    new NetworkFirst({ cacheName: "osmsg-shell-v3", networkTimeoutSeconds: 5 })
 );
 
-// OSMSG API — try network, then cached copy.
+// OSMSG API: network-first with no premature timeout, so a ~75s mega-hashtag query can finish; let the
+// request finish; only fall back to cache when the network genuinely fails (offline).
 registerRoute(
-    ({ url }) => url.hostname === "osmsg.osgeonepal.org" && url.pathname.startsWith("/api/"),
+    ({ url }) => url.pathname.startsWith("/api/"),
     new NetworkFirst({
-        cacheName: "osmsg-api",
-        networkTimeoutSeconds: 10,
+        cacheName: "osmsg-api-v2",
         plugins: [new CacheableResponsePlugin({ statuses: [0, 200] })],
     })
 );
 
-// CDNs (fonts, lucide, tailwind, avatars) — long-lived cache.
+// CDNs (fonts, lucide, tailwind, avatars): long-lived cache.
 registerRoute(
     ({ url }) => ["fonts.googleapis.com", "fonts.gstatic.com", "cdn.jsdelivr.net", "cdn.tailwindcss.com",
         "storage.googleapis.com", "github.com", "avatars.githubusercontent.com"].includes(url.hostname),
@@ -36,3 +36,13 @@ registerRoute(
         ],
     })
 );
+
+// Evict every cache except the current ones, so a stale app.js can never be served after a version bump.
+const CURRENT_CACHES = new Set(["osmsg-shell-v3", "osmsg-api-v2", "osmsg-cdn"]);
+self.addEventListener("activate", (event) => {
+    event.waitUntil(
+        caches.keys().then((keys) =>
+            Promise.all(keys.filter((k) => !CURRENT_CACHES.has(k)).map((k) => caches.delete(k)))
+        )
+    );
+});

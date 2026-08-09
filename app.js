@@ -1,8 +1,7 @@
-// OSMSG Leaderboard 
-const API_BASE = window.location.origin;
-const EDITOR_STATS_ENDPOINT = "/api/v1/editor-stats";
-const EDITOR_STATS_BASE = "https://osmsg-1.onrender.com";
-const ENDPOINT = "/api/v1/stats";
+// OSMSG Leaderboard
+// Single source for the API origin: overridable at deploy time via window.OSMSG_API_BASE (e.g. an
+// env-generated config script), else the page's own origin. Everything (fetches, docs link) derives from it.
+const API_BASE = window.OSMSG_API_BASE || window.location.origin;
 const HEALTH_ENDPOINT = "/health";
 const ALL_TIME_START = "2004-08-09T00:00:00Z";
 const RANGE_HOURS = { "1h": 1, "24h": 24, "7d": 168, "30d": 720, "90d": 2160 };
@@ -15,7 +14,6 @@ const RANGE_LABELS = {
   all: "all-time",
   custom: "custom range",
 };
-const REFRESH_INTERVAL_MS = 60_000;
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
 const state = {
@@ -23,11 +21,17 @@ const state = {
   range: "24h",
   customStart: null,
   customEnd: null,
-  live: true,
   rows: [],
-  filteredRows: [],
+  batch: [],
+  batchIndex: -1,
+  batchSize: 100,
+  podium: [],
+  summary: null,
+  tagRows: [],
+  hashtagTrends: [],
+  total: 0,
+  totalPages: 1,
   sort: { key: "map_changes", dir: "desc" },
-  filter: "all",
   search: "",
   windowStart: null,
   windowEnd: null,
@@ -41,7 +45,7 @@ const state = {
   clockTimer: null,
   inflight: null,
   page: 1,
-  pageSize: 25,
+  pageSize: 10,
   osmAvatars: new Map(),
   editorStats: null,
 };
@@ -74,6 +78,11 @@ function applyAvatar(el, uid, fallbackText) {
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const fmt = new Intl.NumberFormat("en-US");
+const fmtCompact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+const compact = (n) => fmtCompact.format(n || 0);
+// A number that reads human-friendly (2.3M) by default; clicking its tile flips it to the exact value.
+const numHtml = (n) =>
+  `<span class="num" data-full="${fmt.format(n || 0)}" data-compact="${compact(n)}">${compact(n)}</span>`;
 const dtf = (opts) =>
   new Intl.DateTimeFormat(undefined, { ...opts, hour12: false, timeZone: TZ });
 const dtfFull = dtf({
@@ -103,10 +112,10 @@ const refreshIcons = (root) =>
   window.lucide?.createIcons?.(
     root
       ? {
-          attrs: { "stroke-width": 2 },
-          nameAttr: "data-lucide",
-          icons: window.lucide.icons,
-        }
+        attrs: { "stroke-width": 2 },
+        nameAttr: "data-lucide",
+        icons: window.lucide.icons,
+      }
       : { attrs: { "stroke-width": 2 } }
   );
 const isoUTC = (d) => d.toISOString().replace(/\.\d+Z$/, "Z");
@@ -140,8 +149,9 @@ function ago(d) {
   return `${(h / 24) | 0}d ago`;
 }
 function avatarColor(name) {
+  const s = name || "?";
   let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
   return ["#2D5F3F", "#3A6E4A", "#1F4D2E", "#4A7C5C", "#1F5C3D"][h % 5];
 }
 function initials(name) {
@@ -156,13 +166,14 @@ function initials(name) {
 }
 function sumTagKey(ts, k) {
   const n = ts[k];
-  if (!n) return { c: 0, m: 0 };
-  let c = 0, m = 0;
+  if (!n) return { c: 0, m: 0, l: 0 };
+  let c = 0, m = 0, l = 0;
   for (const v in n) {
     c += n[v].c;
     m += n[v].m;
+    l += n[v].len || 0;
   }
-  return { c, m };
+  return { c, m, l };
 }
 
 function transform(row) {
@@ -175,37 +186,40 @@ function transform(row) {
     am = sumTagKey(ts, "amenity");
   return {
     uid: row.uid,
-    username: row.name,
+    username: row.name || `#${row.uid}`,
     hashtags: row.hashtags || [],
+    editors: row.editors || [],
     rank: row.rank,
     changesets: row.changesets,
     map_changes: row.map_changes,
-    nodes_created: row.nodes_create,
-    nodes_modified: row.nodes_modify,
-    nodes_deleted: row.nodes_delete,
-    ways_created: row.ways_create,
-    ways_modified: row.ways_modify,
-    ways_deleted: row.ways_delete,
-    rels_created: row.rels_create,
-    rels_modified: row.rels_modify,
-    rels_deleted: row.rels_delete,
-    pois_created: row.poi_create,
-    pois_modified: row.poi_modify,
+    nodes_created: row.nodes_created,
+    nodes_modified: row.nodes_modified,
+    nodes_deleted: row.nodes_deleted,
+    ways_created: row.ways_created,
+    ways_modified: row.ways_modified,
+    ways_deleted: row.ways_deleted,
+    rels_created: row.rels_created,
+    rels_modified: row.rels_modified,
+    rels_deleted: row.rels_deleted,
+    pois_created: row.poi_created,
+    pois_modified: row.poi_modified,
     buildings_created: b.c,
     buildings_modified: b.m,
     highways_created: h.c,
     highways_modified: h.m,
+    highways_len: h.l,
     landuse_created: lu.c,
     landuse_modified: lu.m,
     waterways_created: wt.c,
     waterways_modified: wt.m,
+    waterways_len: wt.l,
     natural_created: nt.c,
     natural_modified: nt.m,
     amenities_created: am.c,
     amenities_modified: am.m,
-    created: row.nodes_create + row.ways_create + row.rels_create,
-    modified: row.nodes_modify + row.ways_modify + row.rels_modify,
-    deleted: row.nodes_delete + row.ways_delete + row.rels_delete,
+    created: row.nodes_created + row.ways_created + row.rels_created,
+    modified: row.nodes_modified + row.ways_modified + row.rels_modified,
+    deleted: row.nodes_deleted + row.ways_deleted + row.rels_deleted,
     tag_stats: ts,
   };
 }
@@ -221,11 +235,11 @@ function renderChips() {
     .join("");
   chipsEl.querySelectorAll("button").forEach(
     (b) =>
-      (b.onclick = () => {
-        state.hashtags.splice(+b.dataset.i, 1);
-        renderChips();
-        apply();
-      })
+    (b.onclick = () => {
+      state.hashtags.splice(+b.dataset.i, 1);
+      renderChips();
+      apply();
+    })
   );
   refreshIcons();
 }
@@ -235,6 +249,84 @@ function addHashtag(raw) {
   state.hashtags.push(h);
   renderChips();
   return true;
+}
+
+// Recent searches persisted in localStorage so a returning user can reload a prior query in one click.
+// Newest first, unique by hashtag set, capped at RECENT_MAX.
+const RECENT_KEY = "osmsg.recent.v1",
+  RECENT_MAX = 5;
+// Unique by the hashtag set alone (not the range), so the same hashtags searched over different ranges
+// collapse to one recent entry keeping the latest range.
+const recentKey = (e) => e.hashtags.join(",");
+function loadRecent() {
+  try {
+    const v = JSON.parse(localStorage.getItem(RECENT_KEY) || "[]");
+    const arr = Array.isArray(v) ? v.filter((e) => e && Array.isArray(e.hashtags) && e.hashtags.length) : [];
+    const seen = new Set();
+    return arr.filter((e) => {
+      const k = recentKey(e);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  } catch (err) {
+    console.info("Recent searches unavailable:", err.message);
+    return [];
+  }
+}
+function saveRecentSearch() {
+  if (!state.hashtags.length) return;
+  const entry = { hashtags: [...state.hashtags], range: state.range };
+  if (state.range === "custom" && state.customStart && state.customEnd) {
+    entry.start = isoUTC(state.customStart);
+    entry.end = isoUTC(state.customEnd);
+  }
+  const list = [entry, ...loadRecent().filter((e) => recentKey(e) !== recentKey(entry))].slice(0, RECENT_MAX);
+  try {
+    localStorage.setItem(RECENT_KEY, JSON.stringify(list));
+  } catch (err) {
+    console.info("Could not save recent search:", err.message);
+  }
+  renderRecentSearches();
+}
+function applyRecentSearch(entry) {
+  state.hashtags = [...new Set(entry.hashtags.map((h) => String(h).replace(/^#/, "").toLowerCase()))];
+  if (entry.range === "custom" && entry.start && entry.end) {
+    state.customStart = new Date(entry.start);
+    state.customEnd = new Date(entry.end);
+  } else {
+    state.customStart = state.customEnd = null;
+  }
+  setRangePreset(entry.range);
+  renderChips();
+  // Only load the search into the form; the user presses Extract to run it (no auto-fire).
+  apply();
+}
+function renderRecentSearches() {
+  const box = $("#recent-searches");
+  if (!box) return;
+  const list = loadRecent();
+  if (!list.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML =
+    `<span class="rs-label">Recent</span>` +
+    list
+      .map(
+        (e, i) =>
+          `<button type="button" class="rs-chip" data-i="${i}" title="Re-run this search">${escapeHtml(e.hashtags.map((h) => "#" + h).join(", "))}</button>`
+      )
+      .join("");
+  box.querySelectorAll(".rs-chip").forEach((b) => (b.onclick = () => applyRecentSearch(list[+b.dataset.i])));
+}
+
+// A related-hashtag click adds that tag to the current query and re-runs, so the user can drill into the
+// combined set without retyping.
+function addRelatedHashtag(tag) {
+  if (addHashtag(tag)) apply();
 }
 hashtagInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" || e.key === ",") {
@@ -253,16 +345,27 @@ hashtagInput.addEventListener("keydown", (e) => {
     apply();
   }
 });
-hashtagInput.addEventListener("blur", () => {
-  if (hashtagInput.value.trim() && addHashtag(hashtagInput.value)) {
-    hashtagInput.value = "";
-    apply();
-  }
-});
-
 const customRangePanel = $("#custom-range"),
   crRangeInput = $("#cr-range"),
+  crChipText = $("#cr-chip-text"),
   crClearBtn = $("#cr-clear");
+
+const CR_MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const fmtCrDate = (d) => {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCDate()} ${CR_MON[d.getUTCMonth()]} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+};
+// Reflect the calendar's current selection in the chip (single source; no duplicate range input).
+function updateCrChip() {
+  const sel = crPicker?.selectedDates || [];
+  if (sel.length === 2) {
+    crChipText.textContent = `${fmtCrDate(utcInputToDate(sel[0]))} → ${fmtCrDate(utcInputToDate(sel[1]))} UTC`;
+    crClearBtn.hidden = false;
+  } else {
+    crChipText.textContent = "Pick a start and end date below";
+    crClearBtn.hidden = true;
+  }
+}
 
 const dateToUtcInput = (d) => {
   const p = (n) => String(n).padStart(2, "0");
@@ -284,9 +387,13 @@ function initCustomRangePicker() {
     minuteIncrement: 5,
     allowInput: false,
     disableMobile: true,
+    inline: true,
+    showMonths: window.matchMedia?.("(min-width: 700px)").matches ? 2 : 1,
     onChange: (dates) => {
-      crClearBtn.hidden = dates.length === 0;
-      if (dates.length !== 2) return;
+      if (dates.length !== 2) {
+        updateCrChip();
+        return;
+      }
       const s = utcInputToDate(dates[0]),
         e = utcInputToDate(dates[1]);
       if (s >= e)
@@ -294,6 +401,7 @@ function initCustomRangePicker() {
       state.customStart = s;
       state.customEnd = e;
       state.range = "custom";
+      updateCrChip();
       apply();
     },
   });
@@ -301,7 +409,7 @@ function initCustomRangePicker() {
 crClearBtn?.addEventListener("click", () => {
   crPicker?.clear();
   state.customStart = state.customEnd = null;
-  crClearBtn.hidden = true;
+  updateCrChip();
 });
 
 function setRangePreset(k) {
@@ -316,69 +424,70 @@ function setRangePreset(k) {
       const end = nowUTC(),
         start = new Date(end - 86400000);
       crPicker?.setDate([dateToUtcInput(start), dateToUtcInput(end)], false);
-      crClearBtn.hidden = false;
     } else {
       crPicker?.setDate(
         [dateToUtcInput(state.customStart), dateToUtcInput(state.customEnd)],
         false
       );
-      crClearBtn.hidden = false;
     }
+    updateCrChip();
   }
 }
 $$(".preset button").forEach(
   (b) =>
-    (b.onclick = () => {
-      setRangePreset(b.dataset.range);
-      if (b.dataset.range !== "custom") {
-        state.customStart = state.customEnd = null;
-        apply();
+  (b.onclick = () => {
+    const k = b.dataset.range;
+    if (k === "custom") {
+      // Custom toggles the picker: open it if closed, close it (keeping the recorded range) if open.
+      if (state.range === "custom" && customRangePanel.classList.contains("show")) {
+        customRangePanel.classList.remove("show");
+      } else {
+        setRangePreset("custom");
       }
-    })
+      return;
+    }
+    setRangePreset(k);
+    state.customStart = state.customEnd = null;
+    apply();
+  })
 );
 
-const statusPill = $("#status-pill"),
-  statusIconEl = $("#status-icon"),
-  statusText = $("#status-text");
-const STATUS_CFG = {
-  loading: ["loader", true, "Connecting", "Fetching latest stats from the OSMSG API…"],
-  live: ["cloud", false, "Connected", "Connected. Auto-refreshing every 60 seconds. Click to pause."],
-  paused: ["pause", false, "Paused", "Auto-refresh paused. Click to resume."],
-  error: ["cloud-off", false, "Disconnected", "Couldn't reach the OSMSG API. Click to retry."],
-};
-function setStatus(s) {
-  state.status = s;
-  statusPill.dataset.state = s;
-  const [ic, spin, txt, title] = STATUS_CFG[s];
-  statusIconEl.setAttribute("data-lucide", ic);
-  statusIconEl.classList.toggle("ico-spin", spin);
-  statusText.textContent = txt;
-  statusPill.title = title;
-  refreshIcons();
-}
-statusPill.addEventListener("click", () => {
-  if (state.status === "loading") return;
-  if (state.status === "error") return fetchData({});
-  state.live = !state.live;
-  if (state.live) {
-    setStatus("live");
-    startAutoRefresh();
-    fetchData({ silent: true });
-  } else {
-    setStatus("paused");
-    stopAutoRefresh();
-  }
-});
+// Server sort names differ from the table's column keys in one spot.
+const SERVER_SORT = { username: "name", map_changes: "map_changes", created: "created", modified: "modified", deleted: "deleted", changesets: "changesets" };
+const LEADERBOARD_TIMEOUT_MS = 130_000;
 
-const startAutoRefresh = () => {
-  stopAutoRefresh();
-  if (state.range === "all" || state.range === "custom") return;
-  state.refreshTimer = setInterval(() => fetchData({ silent: true }), REFRESH_INTERVAL_MS);
-};
-const stopAutoRefresh = () => {
-  if (state.refreshTimer) clearInterval(state.refreshTimer);
-  state.refreshTimer = null;
-};
+function endpoint(name, params) {
+  const base = `/api/v2/hashtag/${encodeURIComponent(state.hashtags.join(","))}/${name}`;
+  const u = new URL(base, API_BASE);
+  params.forEach((v, k) => u.searchParams.set(k, v));
+  return u;
+}
+async function apiGet(name, params, signal) {
+  const res = await fetch(endpoint(name, params), { headers: { accept: "application/json" }, mode: "cors", signal });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText || ""}`.trim());
+  return res.json();
+}
+// Resolve the window once per query so all sections and the window bar share one [start, end); relative
+// ranges like 30d must not each recompute "now".
+function freezeWindow() {
+  const { start, end } = rangeWindow(state.range);
+  state.windowStart = start;
+  state.windowEnd = end;
+}
+function windowParams() {
+  if (!state.windowStart || !state.windowEnd) freezeWindow();
+  const p = new URLSearchParams();
+  p.set("start", isoUTC(state.windowStart));
+  p.set("end", isoUTC(state.windowEnd));
+  return p;
+}
+
+// Chips, range and search boxes only stage the query; nothing loads until the user hits Search.
+function apply() {
+  freezeWindow();
+  writeURL();
+  renderWindowBar();
+}
 
 $("#query-form").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -386,62 +495,184 @@ $("#query-form").addEventListener("submit", (e) => {
     addHashtag(hashtagInput.value);
     hashtagInput.value = "";
   }
-  apply();
+  // The picker only records the custom range; once extracted, hide it (the window bar shows the range,
+  // click it to reopen).
+  customRangePanel.classList.remove("show");
+  runQuery();
 });
 
-function apply() {
-  state.page = 1;
-  writeURL();
-  fetchData({});
-  state.live ? startAutoRefresh() : stopAutoRefresh();
+// Reference-counted busy state for the Extract spinner. The button is never disabled, so a new query can
+// be submitted anytime; runQuery aborts the in-flight one and restarts.
+let _busyCount = 0;
+// Toggle a class only, keeping the button's child nodes in place: a click whose mousedown landed on a
+// replaced child would be dropped by the browser mid-load.
+function setBusy(busy) {
+  _busyCount = Math.max(0, _busyCount + (busy ? 1 : -1));
+  const btn = $("#search-btn");
+  if (btn) btn.classList.toggle("is-loading", _busyCount > 0);
 }
 
-async function fetchData({ silent = false } = {}) {
-  state.inflight?.abort();
-  state.loading = true;
-  if (!silent) showLoading();
-  setStatus("loading");
-  const { start, end } = rangeWindow(state.range);
-  state.windowStart = start;
-  state.windowEnd = end;
-  const url = new URL(ENDPOINT, API_BASE);
-  url.searchParams.set("start", isoUTC(start));
-  url.searchParams.set("end", isoUTC(end));
-  state.hashtags.forEach((h) => url.searchParams.append("hashtag", h));
-  const ctrl = new AbortController();
-  state.inflight = ctrl;
-  const timeout = setTimeout(() => ctrl.abort(), 30_000);
+// Names the section currently loading, shown under the Extract button while the sequential fetches run.
+function setStatus(msg) {
+  const el = $("#extract-status");
+  if (!el) return;
+  el.textContent = msg || "";
+  el.classList.toggle("on", !!msg);
+}
+
+// One Search loads each section SEQUENTIALLY (summary -> leaderboard -> tags -> trending -> editors) so
+// the small backend is never hit by several heavy queries at once; each renders as it arrives.
+async function runQuery() {
+  state.page = 1;
+  state.search = "";
+  const searchBox = $("#search");
+  if (searchBox) searchBox.value = "";
+  state.sort = { key: "map_changes", dir: "desc" };
+  freezeWindow();
+  writeURL();
   renderWindowBar();
+  fetchHealth();
+  if (!state.hashtags.length) {
+    showEmptyPrompt();
+    return;
+  }
+  saveRecentSearch();
+  state.query?.abort?.();
+  const ctrl = new AbortController();
+  state.query = ctrl;
+  // Clear the previous query's results so nothing stale lingers while the new one loads.
+  state.rows = [];
+  state.batch = [];
+  state.batchIndex = -1;
+  state.podium = [];
+  state.summary = null;
+  state.tagRows = [];
+  state.hashtagTrends = [];
+  state.editorStats = null;
+  state.total = 0;
+  setOverviewLoading();
+  $("#podium")?.closest("section")?.style.setProperty("display", "");
+  $("#podium").innerHTML = "";
+  if (typeof setChartsLoading === "function") setChartsLoading();
+  const base = windowParams();
+  const alive = () => state.query === ctrl;
+  const param = (extra) => {
+    const p = new URLSearchParams(base);
+    for (const k in extra) p.set(k, extra[k]);
+    return p;
+  };
+  setBusy(true);
+  // Clear the button spinner once the primary content (summary + leaderboard) is up; secondary sections
+  // keep loading behind their own inline status.
+  let _released = false;
+  const releasePrimary = () => { if (!_released) { _released = true; setBusy(false); } };
   try {
-    const res = await fetch(url, {
-      headers: { accept: "application/json" },
-      mode: "cors",
-      signal: ctrl.signal,
-    });
-    if (!res.ok)
-      throw new Error(`HTTP ${res.status} ${res.statusText || ""}`.trim());
-    const json = await res.json();
-    state.rows = json.users.map(transform);
+    setStatus("Fetching summary…");
+    const summary = await apiGet("summary", param({}), ctrl.signal);
+    if (!alive()) return;
+    state.summary = summary;
+    renderOverviewTotals();
+    renderOverviewDetails();
+
+    setStatus("Fetching leaderboard…");
+    await loadLeaderboardPage(true);
+    releasePrimary();
+    if (!alive()) return;
+
+    setStatus("Fetching related hashtags…");
+    const trending = await apiGet("hashtags", param({ limit: "50" }), ctrl.signal);
+    if (!alive()) return;
+    // Related hashtags = the OTHER tags on the same changesets; drop the exact searched tag(s).
+    const searched = new Set(state.hashtags.map((h) => String(h).replace(/^#/, "").toLowerCase()));
+    state.hashtagTrends = (trending || []).filter(
+      (t) => !searched.has(String(t.hashtag).replace(/^#/, "").toLowerCase())
+    );
+    if (typeof renderHashtagPieChart === "function") renderHashtagPieChart();
+
+    setStatus("Fetching editors…");
+    await fetchEditorStats();
+    if (!alive()) return;
+
+    setStatus("Fetching tag breakdown…");
+    const tags = await apiGet("tags", param({ limit: "200" }), ctrl.signal);
+    if (!alive()) return;
+    state.tagRows = tags;
+    renderOverviewDetails();
+  } catch (err) {
+    if (err?.name !== "AbortError") console.warn("OSMSG query failed:", err);
+  } finally {
+    releasePrimary();
+    setStatus("");
+    if (alive()) {
+      if (typeof renderHashtagPieChart === "function") renderHashtagPieChart();
+      if (typeof renderEditorBarChart === "function") renderEditorBarChart();
+    }
+  }
+}
+
+// Set the visible page from the already-loaded batch (client-side; no API call).
+function sliceBatchToRows() {
+  const offset = (state.page - 1) * state.pageSize - state.batchIndex * state.batchSize;
+  state.rows = state.batch.slice(offset, offset + state.pageSize);
+}
+
+// The leaderboard is fetched in BATCHES of `batchSize` (one server query, sorted/searched server-side);
+// the UI then pages 10/20/50 WITHIN a batch client-side. Only crossing a batch boundary, or a new
+// sort/search (`forceFetch`), hits the API. `setPodium` seeds the top-3 from the first batch.
+async function loadLeaderboardPage(setPodium = false, forceFetch = false) {
+  if (!state.hashtags.length) return;
+  const startRow = (state.page - 1) * state.pageSize;
+  const batchIndex = Math.floor(startRow / state.batchSize);
+  // Serve from the loaded batch when possible.
+  if (!forceFetch && !setPodium && batchIndex === state.batchIndex && state.batch.length) {
+    sliceBatchToRows();
+    renderTable();
+    renderPagination();
+    return;
+  }
+  showLoading();
+  setBusy(true);
+  state.lbInflight?.abort();
+  const ctrl = new AbortController();
+  state.lbInflight = ctrl;
+  const timeout = setTimeout(() => ctrl.abort(), LEADERBOARD_TIMEOUT_MS);
+  const p = windowParams();
+  p.set("page", String(batchIndex + 1));
+  p.set("page_size", String(state.batchSize));
+  p.set("sort", SERVER_SORT[state.sort.key] || "map_changes");
+  p.set("order", state.sort.dir);
+  if (state.search.trim()) p.set("q", state.search.trim());
+  try {
+    const env = await apiGet("leaderboard", p, ctrl.signal);
+    state.batch = (env.items || []).map(transform);
+    state.batchIndex = batchIndex;
+    state.total = env.total || 0;
+    state.totalPages = Math.max(1, Math.ceil(state.total / state.pageSize));
+    sliceBatchToRows();
+    if (setPodium) {
+      state.podium = state.batch.slice(0, 3);
+      renderPodium();
+    }
+    renderTable();
+    renderPagination();
     state.lastFetched = new Date();
     state.lastError = null;
-    render();
-    fetchHealth();
     updateLastUpdated();
-    if (!silent && state.rows.length)
-      toast({ msg: "Updated", icon: "check-circle-2" });
-    setStatus(state.live ? "live" : "paused");
   } catch (err) {
-    if (err?.name === "AbortError" && state.inflight !== ctrl) return;
-    console.warn("OSMSG API fetch failed:", err);
+    if (err?.name === "AbortError" && state.lbInflight !== ctrl) return;
+    console.warn("OSMSG leaderboard fetch failed:", err);
     state.lastError = err;
-    setStatus("error");
-    if (!silent) showError(err);
-    else toast({ msg: "Reconnect failed", icon: "cloud-off", err: true });
+    showError(err);
   } finally {
     clearTimeout(timeout);
-    state.loading = false;
-    if (state.inflight === ctrl) state.inflight = null;
+    if (state.lbInflight === ctrl) state.lbInflight = null;
+    setBusy(false);
   }
+}
+
+function onSectionError(section, err, ctrl) {
+  if (err?.name === "AbortError" && state.query !== ctrl) return;
+  console.warn(`OSMSG ${section} fetch failed:`, err);
 }
 
 let toastTimer;
@@ -455,60 +686,7 @@ function toast({ msg, icon = "info", err = false } = {}) {
   toastTimer = setTimeout(() => t.classList.remove("show"), 2200);
 }
 
-function applyDerivedFilters() {
-  const q = state.search.trim().toLowerCase();
-  let rows = state.rows.slice();
-  if (q) rows = rows.filter((r) => r.username.toLowerCase().includes(q));
-  if (state.filter === "creators")
-    rows = rows.filter((r) => r.created > r.modified);
-  if (state.filter === "modifiers")
-    rows = rows.filter((r) => r.modified >= r.created);
-  const { key, dir } = state.sort,
-    mul = dir === "asc" ? 1 : -1;
-  rows.sort((a, b) => {
-    let av = a[key] ?? 0,
-      bv = b[key] ?? 0;
-    if (typeof av === "string") {
-      av = av.toLowerCase();
-      bv = (bv || "").toLowerCase();
-    }
-    return av < bv ? -mul : av > bv ? mul : 0;
-  });
-  state.filteredRows = rows;
-  state.page = Math.min(
-    state.page,
-    Math.max(1, Math.ceil(rows.length / state.pageSize))
-  );
-}
 
-async function fetchUserEditor(uid) {
-  const key = String(uid);
-  if (state.userEditors.has(key)) return state.userEditors.get(key);
-
-  try {
-    const { start, end } = rangeWindow(state.range);
-    const url = `https://api.openstreetmap.org/api/0.6/changesets.json?user=${encodeURIComponent(key)}&time=${isoUTC(start)},${isoUTC(end)}&limit=1`;
-    const res = await fetch(url, { headers: { Accept: "application/json" } });
-    if (!res.ok) throw new Error();
-    const json = await res.json();
-    const cs = json?.changesets?.[0];
-    const editor = cs?.tags?.created_by || null;
-    state.userEditors.set(key, editor);
-    return editor;
-  } catch {
-    state.userEditors.set(key, null);
-    return null;
-  }
-}
-
-function render() {
-  applyDerivedFilters();
-  renderOverview();
-  renderPodium();
-  renderTable();
-  renderWindowBar();
-  renderHashtagPieChart();
-}
 
 function aggregateTagStats(rows) {
   const agg = {};
@@ -516,14 +694,16 @@ function aggregateTagStats(rows) {
     const ts = r.tag_stats;
     for (const key in ts) {
       const vals = ts[key];
-      const a = (agg[key] ||= { values: {}, totalC: 0, totalM: 0 });
+      const a = (agg[key] ||= { values: {}, totalC: 0, totalM: 0, totalL: 0 });
       for (const v in vals) {
-        const c = vals[v].c, m = vals[v].m;
-        const slot = (a.values[v] ||= { c: 0, m: 0 });
+        const c = vals[v].c, m = vals[v].m, l = vals[v].len || 0;
+        const slot = (a.values[v] ||= { c: 0, m: 0, l: 0 });
         slot.c += c;
         slot.m += m;
+        slot.l += l;
         a.totalC += c;
         a.totalM += m;
+        a.totalL += l;
       }
     }
   }
@@ -541,6 +721,8 @@ function tagBreakdownHtml(agg, { maxKeys = 10 } = {}) {
   const cntM = (n) => (n ? `<span class="m">~${fmt.format(n)}</span>` : "");
 
   let html =
+    `<div class="tag-legend">Feature counts: <span class="c">+ created</span> <span class="m">~ modified</span>` +
+    ` · <span class="tag-key-len">km</span> = length of ways drawn</div>` +
     `<div class="tag-breakdown-grid">` +
     keys
       .slice(0, maxKeys)
@@ -549,7 +731,7 @@ function tagBreakdownHtml(agg, { maxKeys = 10 } = {}) {
         return `<div class="tag-key-card">
       <div class="tag-key-head">
         <span class="tag-key-name">${escapeHtml(key)}</span>
-        <span class="tag-key-totals">${cntC(d.totalC)}${cntM(d.totalM)}</span>
+        <span class="tag-key-totals">${kmBadge(d.totalL)}${cntC(d.totalC)}${cntM(d.totalM)}</span>
       </div>
       <div class="tag-key-bar" title="${d.totalC} created · ${d.totalM} modified">
         ${segDiv("seg-c", pct(d.totalC, t))}${segDiv("seg-m", pct(d.totalM, t))}
@@ -564,138 +746,154 @@ function tagBreakdownHtml(agg, { maxKeys = 10 } = {}) {
 }
 
 const OV_CELLS_TOTALS = [
-  ["Created", "created", "plus-square", "ov-add"],
-  ["Modified", "modified", "edit-3", "ov-mod"],
-  ["Deleted", "deleted", "trash-2", "ov-del"],
-  ["Mappers", "mappers", "users", ""],
-  ["Changesets", "changesets", "git-commit-horizontal", ""],
+  ["Created", "created", "plus-square", "ov-add", "Elements created (nodes + ways + relations)"],
+  ["Modified", "modified", "edit-3", "ov-mod", "Elements modified"],
+  ["Deleted", "deleted", "trash-2", "ov-del", "Elements deleted"],
+  ["Mappers", "mappers", "users", "", "Distinct contributors"],
+  ["Changesets", "changesets", "git-commit-horizontal", "", "Number of changesets"],
 ];
 const OV_CELLS = [
-  ["Nodes", "nodes", "circle-dot", "elem"],
-  ["Ways", "ways", "spline", "elem"],
-  ["Relations", "rels", "share-2", "elem"],
-  ["Buildings", "buildings", "building-2", "split"],
-  ["Highways", "highways", "route", "split"],
-  ["POIs", "pois", "map-pin", "split"],
-  ["Landuse", "landuse", "layers", "split"],
-  ["Waterways", "waterways", "waves", "split"],
-  ["Natural", "natural", "trees", "split"],
-  ["Amenities", "amenities", "coffee", "split"],
+  ["Nodes", "nodes", "circle-dot", "elem", "Point features. + created  ~ modified  − deleted"],
+  ["Ways", "ways", "spline", "elem", "Lines and areas. + created  ~ modified  − deleted"],
+  ["Relations", "rels", "share-2", "elem", "Grouped features. + created  ~ modified  − deleted"],
+  ["Buildings", "buildings", "building-2", "split", "building=* . + created  ~ modified"],
+  ["Highways", "highways", "route", "split", "highway=* . + created  ~ modified"],
+  ["POIs", "pois", "map-pin", "split", "Points of interest. + created  ~ modified"],
+  ["Landuse", "landuse", "layers", "split", "landuse=* . + created  ~ modified"],
+  ["Waterways", "waterways", "waves", "split", "waterway=* . + created  ~ modified"],
+  ["Natural", "natural", "trees", "split", "natural=* . + created  ~ modified"],
+  ["Amenities", "amenities", "coffee", "split", "amenity=* . + created  ~ modified"],
 ];
+// Only line features carry a meaningful length; areas (buildings, landuse) and points (POIs) do not.
+const LINEAR_CELLS = new Set(["highways", "waterways"]);
 const renderOvCell =
   (data) =>
-  ([l, k, ic, mod]) => {
-    if (mod === "split") {
-      const c = data[k] || 0, m = data[k + "_mod"] || 0;
-      const isZero = !c && !m;
-      return `<div class="ov-cell ov-split${isZero ? " is-zero" : ""}">
+    ([l, k, ic, mod, desc]) => {
+      const tip = escapeHtml(`${desc} · click to toggle exact numbers`);
+      if (mod === "split") {
+        const c = data[k] || 0, m = data[k + "_mod"] || 0;
+        const isZero = !c && !m;
+        const metres = data[k + "_len"] || 0;
+        // Length is meaningful only for line features (highway/waterway); areas/points get no pill.
+        const showKm = LINEAR_CELLS.has(k) && metres >= 100;
+        const kmC = `${compact(metres / 1000)} km`, kmF = `${fmt.format(Math.round(metres / 1000))} km`;
+        const pill = showKm
+          ? `<span class="ov-len-pill" data-compact="${kmC}" data-full="${kmF}" title="${escapeHtml(l)}, length of ways created (created features only); click for the full number">${kmC}</span>`
+          : "";
+        return `<div class="ov-cell ov-split${isZero ? " is-zero" : ""}" title="${tip}">
       <div class="lbl"><i data-lucide="${ic}"></i>${l}</div>
-      <div class="val"><span class="c">+${fmt.format(c)}</span><span class="m">~${fmt.format(m)}</span></div>
+      <div class="val"><span class="c" title="created">+${numHtml(c)}</span><span class="m" title="modified">~${numHtml(m)}</span>${pill}</div>
     </div>`;
-    }
-    if (mod === "elem") {
-      const c = data[k + "_c"] || 0, m = data[k + "_m"] || 0, d = data[k + "_d"] || 0;
-      const isZero = !c && !m && !d;
-      return `<div class="ov-cell ov-elem${isZero ? " is-zero" : ""}">
+      }
+      if (mod === "elem") {
+        const c = data[k + "_c"] || 0, m = data[k + "_m"] || 0, d = data[k + "_d"] || 0;
+        const isZero = !c && !m && !d;
+        return `<div class="ov-cell ov-elem${isZero ? " is-zero" : ""}" title="${tip}">
       <div class="lbl"><i data-lucide="${ic}"></i>${l}</div>
-      <div class="val"><span class="c" title="created">+${fmt.format(c)}</span><span class="m" title="modified">~${fmt.format(m)}</span><span class="d" title="deleted">−${fmt.format(d)}</span></div>
+      <div class="val"><span class="c" title="created">+${numHtml(c)}</span><span class="m" title="modified">~${numHtml(m)}</span><span class="d" title="deleted">−${numHtml(d)}</span></div>
     </div>`;
-    }
-    return `<div class="ov-cell${mod ? " " + mod : ""}${data[k] ? "" : " is-zero"}">
+      }
+      return `<div class="ov-cell${mod ? " " + mod : ""}${data[k] ? "" : " is-zero"}" title="${tip}">
     <div class="lbl"><i data-lucide="${ic}"></i>${l}</div>
-    <div class="val">${fmt.format(data[k] || 0)}</div>
+    <div class="val">${numHtml(data[k] || 0)}</div>
   </div>`;
-  };
+    };
 const ovCellsHtml = (data) => OV_CELLS.map(renderOvCell(data)).join("");
 const ovTotalsHtml = (data) => OV_CELLS_TOTALS.map(renderOvCell(data)).join("");
-const rowTotals = (rows) =>
-  rows.reduce(
-    (a, r) => {
-      a.created += r.created;
-      a.modified += r.modified;
-      a.deleted += r.deleted;
-      a.changesets += r.changesets;
-      a.nodes_c += r.nodes_created;
-      a.nodes_m += r.nodes_modified;
-      a.nodes_d += r.nodes_deleted;
-      a.ways_c += r.ways_created;
-      a.ways_m += r.ways_modified;
-      a.ways_d += r.ways_deleted;
-      a.rels_c += r.rels_created;
-      a.rels_m += r.rels_modified;
-      a.rels_d += r.rels_deleted;
-      a.buildings += r.buildings_created;
-      a.buildings_mod += r.buildings_modified;
-      a.highways += r.highways_created;
-      a.highways_mod += r.highways_modified;
-      a.pois += r.pois_created;
-      a.pois_mod += r.pois_modified;
-      a.landuse += r.landuse_created;
-      a.landuse_mod += r.landuse_modified;
-      a.waterways += r.waterways_created;
-      a.waterways_mod += r.waterways_modified;
-      a.natural += r.natural_created;
-      a.natural_mod += r.natural_modified;
-      a.amenities += r.amenities_created;
-      a.amenities_mod += r.amenities_modified;
-      return a;
-    },
-    {
-      created: 0, modified: 0, deleted: 0, changesets: 0,
-      nodes_c: 0, nodes_m: 0, nodes_d: 0,
-      ways_c: 0, ways_m: 0, ways_d: 0,
-      rels_c: 0, rels_m: 0, rels_d: 0,
-      buildings: 0, buildings_mod: 0,
-      highways: 0, highways_mod: 0,
-      pois: 0, pois_mod: 0,
-      landuse: 0, landuse_mod: 0,
-      waterways: 0, waterways_mod: 0,
-      natural: 0, natural_mod: 0,
-      amenities: 0, amenities_mod: 0,
-    }
-  );
+// The /summary totals mapped to the overview's element cells; created/modified/deleted fold node+way+rel.
+function summaryToData(s) {
+  return {
+    created: (s.nodes_created || 0) + (s.ways_created || 0) + (s.rels_created || 0),
+    modified: (s.nodes_modified || 0) + (s.ways_modified || 0) + (s.rels_modified || 0),
+    deleted: (s.nodes_deleted || 0) + (s.ways_deleted || 0) + (s.rels_deleted || 0),
+    mappers: s.users || 0,
+    changesets: s.changesets || 0,
+    nodes_c: s.nodes_created || 0, nodes_m: s.nodes_modified || 0, nodes_d: s.nodes_deleted || 0,
+    ways_c: s.ways_created || 0, ways_m: s.ways_modified || 0, ways_d: s.ways_deleted || 0,
+    rels_c: s.rels_created || 0, rels_m: s.rels_modified || 0, rels_d: s.rels_deleted || 0,
+    pois: s.poi_created || 0, pois_mod: s.poi_modified || 0,
+  };
+}
+// The /tags rows folded to the overview's tag cells + the key breakdown grid.
+const TAG_CELL_KEYS = ["building", "highway", "landuse", "waterway", "natural", "amenity"];
+const TAG_CELL_FIELD = { building: "buildings", highway: "highways", landuse: "landuse", waterway: "waterways", natural: "natural", amenity: "amenities" };
+function tagRowsToData(rows) {
+  const out = {};
+  for (const k of TAG_CELL_KEYS) { out[TAG_CELL_FIELD[k]] = 0; out[TAG_CELL_FIELD[k] + "_mod"] = 0; }
+  for (const r of rows) {
+    const f = TAG_CELL_FIELD[r.tag_key];
+    if (!f) continue;
+    out[f] += r.creates || 0;
+    out[f + "_mod"] += r.modifies || 0;
+    out[f + "_len"] = (out[f + "_len"] || 0) + (r.length_m || 0);
+  }
+  return out;
+}
+function tagRowsToAgg(rows) {
+  const agg = {};
+  for (const r of rows) {
+    const a = (agg[r.tag_key] ||= { values: {}, totalC: 0, totalM: 0, totalL: 0 });
+    const slot = (a.values[r.tag_value] ||= { c: 0, m: 0, l: 0 });
+    slot.c += r.creates || 0; slot.m += r.modifies || 0; slot.l += r.length_m || 0;
+    a.totalC += r.creates || 0; a.totalM += r.modifies || 0; a.totalL += r.length_m || 0;
+  }
+  return agg;
+}
 
-function renderOverview() {
-  const strip = $("#ov-strip"),
-    totals = $("#ov-strip-totals"),
-    breakdown = $("#ov-breakdown");
-  const details = $("#ov-details");
-  const meta = $("#ov-breakdown-meta"),
-    btn = $("#ov-toggle-btn"),
-    label = $("#ov-toggle-label");
-  if (!state.rows.length) {
-    totals.innerHTML = `<div class="tag-stats-empty" style="grid-column:1/-1">No data in this window. Try a wider time range or a different hashtag.</div>`;
-    strip.innerHTML = "";
-    breakdown.innerHTML = "";
-    details.hidden = true;
-    btn.setAttribute("aria-expanded", "false");
-    btn.disabled = true;
-    meta.textContent = "";
-    return;
-  }
-  const data = { ...rowTotals(state.rows), mappers: state.rows.length };
-  totals.innerHTML = ovTotalsHtml(data);
-  strip.innerHTML = ovCellsHtml(data);
-  const { html, keyCount, valueCount } = tagBreakdownHtml(aggregateTagStats(state.rows));
-  if (keyCount) {
-    breakdown.innerHTML = html;
-    meta.textContent = `${fmt.format(keyCount)} tag key${keyCount === 1 ? "" : "s"} · ${fmt.format(valueCount)} value${valueCount === 1 ? "" : "s"} available`;
-  } else {
-    breakdown.innerHTML = `<div class="tag-stats-empty">No detailed tag stats reported in this window.</div>`;
-    meta.textContent = "element breakdown only";
-  }
-  btn.disabled = false;
-  const expanded = btn.getAttribute("aria-expanded") === "true";
-  details.hidden = !expanded;
-  label.textContent = expanded ? "Hide details" : "Show details";
+function kmText(metres) {
+  if (!metres || metres < 100) return "";
+  const km = metres / 1000;
+  return (km >= 100 ? fmt.format(Math.round(km)) : km.toFixed(1)) + " km";
+}
+function kmBadge(metres) {
+  const t = kmText(metres);
+  return t ? `<span class="tag-key-len" title="${fmt.format(Math.round(metres))} m of open ways">${t}</span>` : "";
+}
+
+function setOverviewLoading() {
+  $("#overview")?.closest("section")?.style.setProperty("display", "");
+  const skel = Array.from({ length: 5 }, () => `<div class="ov-cell"><div class="skeleton" style="height:12px;width:60px"></div><div class="skeleton" style="height:20px;width:90px;margin-top:8px"></div></div>`).join("");
+  $("#ov-strip-totals").innerHTML = skel;
+  setDetailsOpen(false);
+  $("#ov-toggle-btn").disabled = true;
+  $("#ov-breakdown-meta").textContent = "";
+}
+
+function showEmptyPrompt() {
+  $("#overview")?.closest("section")?.style.setProperty("display", "none");
+  $("#podium")?.closest("section")?.style.setProperty("display", "none");
+  $("#ov-details").hidden = true;
+  $("#podium").innerHTML = "";
+  $("#lb-body").innerHTML = `<tr><td colspan="8"><div class="empty"><i data-lucide="arrow-down-to-line"></i><h3>Extract a hashtag</h3><p>Type one or more hashtags above and press Extract.</p></div></td></tr>`;
+  $("#pagination").hidden = true;
   refreshIcons();
 }
 
+function renderOverviewTotals() {
+  if (!state.summary) return;
+  $("#ov-strip-totals").innerHTML = ovTotalsHtml(summaryToData(state.summary));
+  refreshIcons($("#ov-strip-totals"));
+}
+
+function renderOverviewDetails() {
+  const data = { ...(state.summary ? summaryToData(state.summary) : {}), ...tagRowsToData(state.tagRows) };
+  $("#ov-strip").innerHTML = ovCellsHtml(data);
+  const btn = $("#ov-toggle-btn"), meta = $("#ov-breakdown-meta");
+  const agg = tagRowsToAgg(state.tagRows);
+  const { html, keyCount, valueCount } = tagBreakdownHtml(agg);
+  if (keyCount) {
+    $("#ov-breakdown").innerHTML = html;
+    meta.textContent = `${fmt.format(keyCount)} tag key${keyCount === 1 ? "" : "s"} · ${fmt.format(valueCount)} value${valueCount === 1 ? "" : "s"} available`;
+  } else {
+    $("#ov-breakdown").innerHTML = `<div class="tag-stats-empty">No detailed tag stats reported in this window.</div>`;
+    meta.textContent = "";
+  }
+  btn.disabled = false;
+  refreshIcons($("#ov-details"));
+}
+
 function renderPodium() {
-  const top3 = state.rows
-    .slice()
-    .sort((a, b) => b.map_changes - a.map_changes)
-    .slice(0, 3);
+  const top3 = state.podium.slice(0, 3);
   const el = $("#podium");
 
   if (!top3.length) {
@@ -713,33 +911,33 @@ function renderPodium() {
 
     if (!r) {
       div.style.opacity = "0.4";
-      div.innerHTML = `<span class="pod-rank">${place}</span><span class="pod-avatar">·</span><span class="pod-name">—</span><span class="pod-score-wrap"><span class="pod-score">0</span></span>`;
+      div.innerHTML = `<span class="pod-rank">${place}</span><span class="pod-avatar">·</span><span class="pod-name">·</span><span class="pod-score-wrap"><span class="pod-score">0</span></span>`;
       el.appendChild(div);
       continue;
     }
 
-    const created  = (r.nodes_created  || 0) + (r.ways_created  || 0) + (r.rels_created  || 0);
+    const created = (r.nodes_created || 0) + (r.ways_created || 0) + (r.rels_created || 0);
     const modified = (r.nodes_modified || 0) + (r.ways_modified || 0) + (r.rels_modified || 0);
-    const deleted  = (r.nodes_deleted  || 0) + (r.ways_deleted  || 0) + (r.rels_deleted  || 0);
+    const deleted = (r.nodes_deleted || 0) + (r.ways_deleted || 0) + (r.rels_deleted || 0);
 
-    // No editor badge here — editor info is shown only in the user modal
+    // Editor info is shown only in the user modal, not on the podium.
     div.innerHTML = `
       <span class="pod-rank">${place}</span>
       <span class="pod-avatar" data-osm-uid="${r.uid}" style="background:${avatarColor(r.username)}">${initials(r.username)}</span>
       <span class="pod-name" title="${escapeHtml(r.username)}">${escapeHtml(r.username)}</span>
       <span class="pod-score-wrap">
         <div class="pod-score-line">
-          <span class="pod-score">${fmt.format(r.map_changes)}</span>
-          <span class="pod-cs" title="changesets">
-            <i data-lucide="git-commit-horizontal"></i>${fmt.format(r.changesets || 0)}
+          <span class="pod-score" title="${fmt.format(r.map_changes)} map changes">${compact(r.map_changes)}</span>
+          <span class="pod-cs" title="${fmt.format(r.changesets || 0)} changesets">
+            <i data-lucide="git-commit-horizontal"></i>${compact(r.changesets || 0)}
           </span>
         </div>
         <div class="pod-score-label">changes · changesets</div>
       </span>
       <div class="pod-mini" aria-label="Created, modified, deleted">
-        <span class="c" title="created"><i data-lucide="plus"></i>${fmt.format(created)}</span>
-        <span class="m" title="modified"><i data-lucide="pencil"></i>${fmt.format(modified)}</span>
-        <span class="d" title="deleted"><i data-lucide="minus"></i>${fmt.format(deleted)}</span>
+        <span class="c" title="${fmt.format(created)} created"><i data-lucide="plus"></i>${compact(created)}</span>
+        <span class="m" title="${fmt.format(modified)} modified"><i data-lucide="pencil"></i>${compact(modified)}</span>
+        <span class="d" title="${fmt.format(deleted)} deleted"><i data-lucide="minus"></i>${compact(deleted)}</span>
       </div>`;
 
     applyAvatar(div.querySelector(".pod-avatar"), r.uid, initials(r.username));
@@ -754,29 +952,46 @@ function renderPodium() {
 
 function shortEditor(s) {
   if (!s) return "Unknown";
-  const iD = s.match(/iD\s*([\d.]+)/i);   if (iD)   return "iD " + iD[1];
+  const iD = s.match(/iD\s*([\d.]+)/i); if (iD) return "iD " + iD[1];
   const josm = s.match(/JOSM\/([\d.]+)/i); if (josm) return "JOSM " + josm[1];
   const rapid = s.match(/Rapid\s*([\d.]+)/i); if (rapid) return "Rapid " + rapid[1];
-  if (/Vespucci/i.test(s))       return "Vespucci";
+  if (/Vespucci/i.test(s)) return "Vespucci";
   if (/StreetComplete/i.test(s)) return "StreetComplete";
-  if (/OsmAnd/i.test(s))        return "OsmAnd";
+  if (/OsmAnd/i.test(s)) return "OsmAnd";
   return s.length > 22 ? s.slice(0, 20) + "…" : s;
 }
 function editorFamily(s) {
   if (!s) return null;
-  if (/iD/i.test(s))            return "iD";
-  if (/JOSM/i.test(s))          return "JOSM";
-  if (/Rapid/i.test(s))         return "Rapid";
-  if (/Vespucci/i.test(s))      return "Vespucci";
+  if (/iD/i.test(s)) return "iD";
+  if (/JOSM/i.test(s)) return "JOSM";
+  if (/Rapid/i.test(s)) return "Rapid";
+  if (/Vespucci/i.test(s)) return "Vespucci";
   if (/StreetComplete/i.test(s)) return "StreetComplete";
   return null;
 }
+
+// Group a user's editors by family for a compact profile line: "iD (2.41.2, 2.34.0), JOSM 1.5".
+function groupEditorsText(editors) {
+  const fams = new Map();
+  for (const e of editors) {
+    const fam = editorFamily(e) || String(e || "").split(/[/\s]/)[0] || "Unknown";
+    const short = shortEditor(e);
+    const ver = short.toLowerCase().startsWith(fam.toLowerCase()) ? short.slice(fam.length).trim() : short;
+    if (!fams.has(fam)) fams.set(fam, []);
+    if (ver && !fams.get(fam).includes(ver)) fams.get(fam).push(ver);
+  }
+  return [...fams.entries()]
+    .map(([fam, vers]) =>
+      vers.length === 0 ? fam : vers.length === 1 ? `${fam} ${vers[0]}` : `${fam} (${vers.join(", ")})`
+    )
+    .join(", ");
+}
 function editorColor(family) {
   const map = {
-    iD:             ["#E6F1FB", "#185FA5"],
-    JOSM:           ["#FAEEDA", "#854F0B"],
-    Rapid:          ["#EEEDFE", "#534AB7"],
-    Vespucci:       ["#EAF3DE", "#3B6D11"],
+    iD: ["#E6F1FB", "#185FA5"],
+    JOSM: ["#FAEEDA", "#854F0B"],
+    Rapid: ["#EEEDFE", "#534AB7"],
+    Vespucci: ["#EAF3DE", "#3B6D11"],
     StreetComplete: ["#FAECE7", "#993C1D"],
   };
   return map[family] || ["#F1EFE8", "#5F5E5A"];
@@ -807,9 +1022,9 @@ const elemCellsHtml = (r) =>
     return `<div class="ov-cell ov-elem${isZero ? " is-zero" : ""}">
     <div class="lbl"><i data-lucide="${ic}"></i>${l}</div>
     <div class="val">
-      <span class="c" title="created">+${fmt.format(c)}</span>
-      <span class="m" title="modified">~${fmt.format(m)}</span>
-      <span class="d" title="deleted">−${fmt.format(d)}</span>
+      <span class="c" title="created">+${numHtml(c)}</span>
+      <span class="m" title="modified">~${numHtml(m)}</span>
+      <span class="d" title="deleted">−${numHtml(d)}</span>
     </div>
   </div>`;
   }).join("");
@@ -830,14 +1045,19 @@ const cellsHtml = (cells, r) =>
         const [ck, mk] = SPLIT_KEY_MAP[k];
         const c = r[ck] || 0, m = r[mk] || 0;
         const isZero = !c && !m;
+        const metres = LINEAR_CELLS.has(k) ? (r[k + "_len"] || 0) : 0;
+        const kmC = `${compact(metres / 1000)} km`, kmF = `${fmt.format(Math.round(metres / 1000))} km`;
+        const kmPill = metres >= 100
+          ? `<span class="ov-len-pill" data-compact="${kmC}" data-full="${kmF}" title="${kmF}, length of ways created (created features only); click for the full number">${kmC}</span>`
+          : "";
         return `<div class="ov-cell ov-split${isZero ? " is-zero" : ""}">
       <div class="lbl"><i data-lucide="${ic}"></i>${l}</div>
-      <div class="val"><span class="c">+${fmt.format(c)}</span><span class="m">~${fmt.format(m)}</span></div>
+      <div class="val"><span class="c">+${numHtml(c)}</span><span class="m">~${numHtml(m)}</span>${kmPill}</div>
     </div>`;
       }
       return `<div class="ov-cell${mod ? " " + mod : ""}${r[k] ? "" : " is-zero"}">
     <div class="lbl"><i data-lucide="${ic}"></i>${l}</div>
-    <div class="val">${fmt.format(r[k] || 0)}</div>
+    <div class="val">${numHtml(r[k] || 0)}</div>
   </div>`;
     })
     .join("");
@@ -861,65 +1081,46 @@ function openUserModal(username) {
   av.dataset.osmUid = String(r.uid);
   applyAvatar(av, r.uid, initials(r.username));
 
-  const userHashtags = (r.hashtags || []).filter(Boolean).map((h) => String(h).replace(/^#/, ""));
-  let hashtagHtml = "";
-  if (userHashtags.length) {
-    hashtagHtml = `
-  <div class="ov-cell ov-split" style="margin-bottom:10px;">
-    <div class="lbl"><i data-lucide="hash"></i> Hashtags   <div class="val">
-    +${fmt.format(userHashtags.length)}
-    </div> </div>
-    <div class="hashtag-grid">
-      ${userHashtags.map((h) => `<div class="hashtag-item"><span class="hash">#</span>${escapeHtml(h)}</div>`).join("")}
-    </div>
-  </div>`;
-  }
-
-  const editorCellId = `editor-cell-${r.uid}`;
-  const editorCellHtml = `
-  <div class="overview-strip" style="margin-top:6px">
-    <div class="ov-cell" id="${editorCellId}">
-      <div class="lbl"><i data-lucide="pen-tool"></i>Editor</div>
-      <div class="val" style="font-size:13px;color:var(--muted)">loading…</div>
-    </div>
-  </div>`;
+  const userHashtags = (r.hashtags || [])
+    .filter(Boolean)
+    .map((h) => "#" + String(h).replace(/^#/, ""));
+  const hashtagLine = userHashtags.length
+    ? `<div class="modal-hashtags">${userHashtags.map((h) => `<span class="mh-chip">${escapeHtml(h)}</span>`).join("")}</div>`
+    : "";
+  const modalEditors = (r.editors || []).filter(Boolean);
+  const editorText = modalEditors.length ? groupEditorsText(modalEditors) : "Unknown";
+  const editorLine = `<div class="modal-editor"><i data-lucide="pen-tool"></i> <span title="${escapeHtml(modalEditors.join(", "))}">${escapeHtml(editorText)}</span></div>`;
 
   const { html: tagHtml, keyCount, valueCount } = tagBreakdownHtml(aggregateTagStats([r]), { maxKeys: 24, maxVals: 8 });
-  let html = hashtagHtml;
+  let html = `<div class="modal-meta">${hashtagLine}${editorLine}</div>`;
   html += `<div class="overview-strip">${cellsHtml(USER_TOTAL_CELLS, r)}</div>`;
-  html += editorCellHtml;
   html += `<div class="overview-strip" style="margin-top:6px">${elemCellsHtml(r)}</div>`;
 
-  // Fetch editor and patch the cell value in place
-  fetchUserEditor(r.uid).then((editor) => {
-    const cell = document.getElementById(editorCellId);
-    if (!cell) return;
-    const valEl = cell.querySelector(".val");
-    if (!valEl) return;
-    if (!editor) {
-      valEl.textContent = "Unknown";
-      valEl.style.color = "var(--muted)";
-      return;
-    }
-    const short = shortEditor(editor);
-    const family = editorFamily(editor);
-    const [ebg, efg] = editorColor(family);
-    valEl.innerHTML = `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600;background:${ebg};color:${efg};border:0.5px solid ${efg}44" title="${escapeHtml(editor)}">${escapeHtml(short)}</span>`;
-  });
   if (keyCount) {
     html += `
-      <div class="ov-toggle" style="border-bottom:none">
-        <span class="ov-breakdown-meta">${fmt.format(keyCount)} tag key${keyCount === 1 ? "" : "s"} · ${fmt.format(valueCount)} value${valueCount === 1 ? "" : "s"}</span>
-        <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.1em;font-weight:600;display:flex;align-items:center;gap:5px;">
-          <i data-lucide="tags"></i>Detailed tag contributions
-        </span>
+      <div class="ov-toggle" style="margin-top:10px">
+        <span class="ov-breakdown-meta"><i data-lucide="tags"></i> Detailed tag contributions · ${fmt.format(keyCount)} key${keyCount === 1 ? "" : "s"}</span>
+        <button type="button" class="ov-toggle-btn" id="modal-tag-toggle" aria-expanded="false" aria-controls="modal-tag-details">
+          <span id="modal-tag-label">Show details</span><span class="ov-caret" aria-hidden="true">▾</span>
+        </button>
       </div>
-      <div class="ov-breakdown" style="margin-top:8px">${tagHtml}</div>`;
+      <div class="ov-breakdown" id="modal-tag-details" hidden style="margin-top:10px">${tagHtml}</div>`;
   } else {
     html += `<div class="tag-stats-empty" style="margin-top:14px">No detailed tag stats reported for this contributor in this window.</div>`;
   }
 
   $("#user-modal-body").innerHTML = html;
+  const mtToggle = $("#modal-tag-toggle");
+  if (mtToggle) {
+    mtToggle.addEventListener("click", () => {
+      const open = mtToggle.getAttribute("aria-expanded") !== "true";
+      mtToggle.setAttribute("aria-expanded", open ? "true" : "false");
+      $("#modal-tag-details").hidden = !open;
+      $("#modal-tag-label").textContent = open ? "Hide details" : "Show details";
+      const c = mtToggle.querySelector(".ov-caret");
+      if (c) c.textContent = open ? "▴" : "▾";
+    });
+  }
   modal.hidden = false;
   modal.classList.add("open");
   document.body.style.overflow = "hidden";
@@ -935,11 +1136,11 @@ function closeUserModal() {
 }
 
 function renderTable() {
-  const tb = $("#lb-body"), allRows = state.filteredRows;
-  if (!allRows.length) {
-    tb.innerHTML = `<tr><td colspan="8"><div class="empty"><i data-lucide="search-x"></i><h3>Nothing to show</h3><p>${state.rows.length ? "Try clearing your search." : "No data for this time range and hashtag combination yet."}</p></div></td></tr>`;
+  const tb = $("#lb-body");
+  if (!state.rows.length) {
+    tb.innerHTML = `<tr><td colspan="8"><div class="empty"><i data-lucide="search-x"></i><h3>Nothing to show</h3><p>${state.search ? "No contributor matches your search." : "No data for this time range and hashtag combination yet."}</p></div></td></tr>`;
     refreshIcons(tb);
-    renderPagination(0, 0, 0);
+    renderPagination();
     return;
   }
   $$("th.sortable").forEach((th) => {
@@ -952,19 +1153,13 @@ function renderTable() {
       arrow.setAttribute("data-lucide", "chevrons-up-down");
     }
   });
-  const total = allRows.length;
-  const totalPages = Math.max(1, Math.ceil(total / state.pageSize));
-  state.page = Math.min(Math.max(1, state.page), totalPages);
-  const startIdx = (state.page - 1) * state.pageSize;
-  const endIdx = Math.min(total, startIdx + state.pageSize);
-  tb.innerHTML = allRows
-    .slice(startIdx, endIdx)
-    .map((r, i) => {
-      const rank = startIdx + i + 1, rc = rank <= 3 ? `r${rank}` : "";
+  tb.innerHTML = state.rows
+    .map((r) => {
+      const rank = r.rank;
       const t = Math.max(1, r.map_changes);
       const cP = (r.created / t) * 100, mP = (r.modified / t) * 100, dP = (r.deleted / t) * 100;
       return `<tr data-user="${escapeHtml(r.username)}" class="lb-row" tabindex="0" role="button" aria-label="View ${escapeHtml(r.username)} contributions">
-      <td class="col-rank ${rc}">${rank <= 3 ? `<span class="top">${rank}</span>` : rank}</td>
+      <td class="col-rank">${rank}</td>
       <td class="col-user"><div class="user-cell">
         <span class="avatar" style="background:${avatarColor(r.username)}">${initials(r.username)}</span>
         <a class="username" href="https://www.openstreetmap.org/user/${encodeURIComponent(r.username)}" target="_blank" rel="noopener" title="${escapeHtml(r.username)}" onclick="event.stopPropagation()">${escapeHtml(r.username)}</a><i data-lucide="external-link" class="ext-link"></i>
@@ -987,14 +1182,16 @@ function renderTable() {
       if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openUserModal(tr.dataset.user); }
     });
   });
-  renderPagination(total, startIdx + 1, endIdx);
+  renderPagination();
 }
 
-function renderPagination(total, from, to) {
+function renderPagination() {
   const wrap = $("#pagination"), info = $("#pg-info"), ctrls = $("#pg-controls");
+  const total = state.total;
   if (!total) { wrap.hidden = true; return; }
   wrap.hidden = false;
-  const totalPages = Math.max(1, Math.ceil(total / state.pageSize)), cur = state.page;
+  const totalPages = state.totalPages, cur = state.page;
+  const from = (cur - 1) * state.pageSize + 1, to = Math.min(total, cur * state.pageSize);
   info.innerHTML = `Showing <b>${fmt.format(from)}</b>–<b>${fmt.format(to)}</b> of <b>${fmt.format(total)}</b>`;
   const pages = [1];
   if (cur - 1 > 2) pages.push("…");
@@ -1014,76 +1211,161 @@ function renderPagination(total, from, to) {
       const p = parseInt(b.dataset.page, 10);
       if (!isFinite(p)) return;
       state.page = p;
-      renderTable();
+      writeURL();
+      loadLeaderboardPage();
       document.querySelector(".table-wrap").scrollIntoView({ behavior: "smooth", block: "start" });
     })
   );
 }
 
 $("#pg-size").addEventListener("change", (e) => {
-  state.pageSize = parseInt(e.target.value, 10) || 25;
+  state.pageSize = parseInt(e.target.value, 10) || 10;
   state.page = 1;
   writeURL();
-  renderTable();
+  loadLeaderboardPage();
 });
+let searchTimer;
 $("#search").addEventListener("input", (e) => {
   state.search = e.target.value;
   state.page = 1;
-  applyDerivedFilters();
-  renderTable();
+  clearTimeout(searchTimer);
+  // Search is server-side across all users -> refetch a fresh batch.
+  searchTimer = setTimeout(() => loadLeaderboardPage(false, true), 350);
 });
-$$(".pill-toggle button").forEach(
-  (b) => (b.onclick = () => {
-    $$(".pill-toggle button").forEach((x) => x.removeAttribute("aria-pressed"));
-    b.setAttribute("aria-pressed", "true");
-    state.filter = b.dataset.filter;
-    state.page = 1;
-    applyDerivedFilters();
-    renderTable();
-  })
-);
 $$("th.sortable").forEach(
   (th) => (th.onclick = () => {
+    if (!state.hashtags.length) return;
     const k = th.dataset.sort;
     if (state.sort.key === k)
       state.sort.dir = state.sort.dir === "asc" ? "desc" : "asc";
     else { state.sort.key = k; state.sort.dir = k === "username" ? "asc" : "desc"; }
     state.page = 1;
-    applyDerivedFilters();
-    renderTable();
+    writeURL();
+    // Sorting is server-side across all users -> refetch a fresh batch.
+    loadLeaderboardPage(false, true);
   })
 );
 
-$("#export-btn").addEventListener("click", () => {
-  if (!state.rows.length)
-    return toast({ msg: "Nothing to export", icon: "alert-triangle", err: true });
-  const cols = [
-    "rank", "uid", "username", "map_changes", "created", "modified", "deleted", "changesets",
-    "nodes_created", "nodes_modified", "nodes_deleted",
-    "ways_created", "ways_modified", "ways_deleted",
-    "rels_created", "rels_modified", "rels_deleted",
-    "pois_created", "pois_modified",
-    "buildings_created", "buildings_modified",
-    "highways_created", "highways_modified",
-  ];
-  const sorted = state.rows.slice().sort((a, b) => b.map_changes - a.map_changes);
-  const lines = [cols.join(",")];
+// Overview tiles read compact (2.3M) by default; clicking a tile flips its numbers to the exact value.
+$("#overview").addEventListener("click", (e) => {
+  const pill = e.target.closest(".ov-len-pill");
+  if (pill) {
+    // Clicking the length pill toggles compact km <-> the full number, without flipping the tile's counts.
+    const full = pill.classList.toggle("full");
+    pill.textContent = full ? pill.dataset.full : pill.dataset.compact;
+    return;
+  }
+  const cell = e.target.closest(".ov-cell");
+  if (!cell) return;
+  const raw = cell.classList.toggle("raw");
+  cell.querySelectorAll(".num").forEach((s) => { s.textContent = raw ? s.dataset.full : s.dataset.compact; });
+});
+
+// Same compact <-> exact toggle inside the profile modal, so the tiles behave like the main page.
+$("#user-modal-body").addEventListener("click", (e) => {
+  const pill = e.target.closest(".ov-len-pill");
+  if (pill) {
+    const full = pill.classList.toggle("full");
+    pill.textContent = full ? pill.dataset.full : pill.dataset.compact;
+    return;
+  }
+  const cell = e.target.closest(".ov-cell");
+  if (!cell) return;
+  const raw = cell.classList.toggle("raw");
+  cell.querySelectorAll(".num").forEach((s) => { s.textContent = raw ? s.dataset.full : s.dataset.compact; });
+});
+
+const EXPORT_COLS = [
+  "rank", "uid", "username", "map_changes", "created", "modified", "deleted", "changesets",
+  "nodes_created", "nodes_modified", "nodes_deleted",
+  "ways_created", "ways_modified", "ways_deleted",
+  "rels_created", "rels_modified", "rels_deleted",
+  "pois_created", "pois_modified",
+  "buildings_created", "buildings_modified",
+  "highways_created", "highways_modified", "highways_km",
+  "landuse_created", "landuse_modified",
+  "waterways_created", "waterways_modified", "waterways_km",
+  "natural_created", "natural_modified",
+  "amenities_created", "amenities_modified",
+];
+
+function buildCsv(rows) {
+  const km = (metres) => Math.round((metres || 0) / 100) / 10;
+  const sorted = rows.slice().sort((a, b) => b.map_changes - a.map_changes);
+  const lines = [EXPORT_COLS.join(",")];
   sorted.forEach((r, i) => {
-    const row = { ...r, rank: i + 1 };
-    lines.push(cols.map((c) => {
-      const s = String(row[c]);
+    const row = { ...r, rank: i + 1, highways_km: km(r.highways_len), waterways_km: km(r.waterways_len) };
+    lines.push(EXPORT_COLS.map((c) => {
+      const v = row[c];
+      const s = v === undefined || v === null ? "" : String(v);
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     }).join(","));
   });
-  const blob = new Blob([lines.join("\n")], { type: "text/csv" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  const tag = state.hashtags.length ? state.hashtags.join("-") : "all";
-  a.href = url;
-  a.download = `osmsg-leaderboard-${tag}-${state.range}-${new Date().toISOString().slice(0, 10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-  toast({ msg: "CSV downloaded", icon: "download" });
+  return lines.join("\n");
+}
+
+// The leaderboard is server-paginated (100/page max), so export pages through every contributor rather
+// than only the rows currently on screen, reporting progress as each page lands.
+async function fetchAllLeaderboardRows(onProgress, signal) {
+  const SIZE = 100;
+  const params = (page) => {
+    const p = windowParams();
+    p.set("page", String(page));
+    p.set("page_size", String(SIZE));
+    p.set("sort", SERVER_SORT[state.sort.key] || "map_changes");
+    p.set("order", state.sort.dir);
+    if (state.search.trim()) p.set("q", state.search.trim());
+    return p;
+  };
+  const first = await apiGet("leaderboard", params(1), signal);
+  const totalPages = Math.max(1, Math.ceil((first.total || 0) / SIZE));
+  let rows = (first.items || []).map(transform);
+  onProgress(1, totalPages);
+  for (let page = 2; page <= totalPages; page++) {
+    const env = await apiGet("leaderboard", params(page), signal);
+    rows = rows.concat((env.items || []).map(transform));
+    onProgress(page, totalPages);
+  }
+  return rows;
+}
+
+function setExportProgress(done, total) {
+  const box = $("#export-progress");
+  if (!box) return;
+  box.hidden = false;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  $("#export-progress-fill").style.width = `${pct}%`;
+  $("#export-progress-count").textContent = `${done} / ${total} pages`;
+}
+
+let _exporting = false;
+$("#export-btn").addEventListener("click", async () => {
+  if (_exporting) return;
+  if (!state.hashtags.length || !state.total)
+    return toast({ msg: "Nothing to export", icon: "alert-triangle", err: true });
+  _exporting = true;
+  const btn = $("#export-btn");
+  btn.disabled = true;
+  const ctrl = new AbortController();
+  setExportProgress(0, Math.max(1, Math.ceil(state.total / 100)));
+  try {
+    const rows = await fetchAllLeaderboardRows(setExportProgress, ctrl.signal);
+    const tag = state.hashtags.length ? state.hashtags.join("-") : "all";
+    const blob = new Blob([buildCsv(rows)], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `osmsg-leaderboard-${tag}-${state.range}-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast({ msg: `CSV downloaded (${rows.length} contributors)`, icon: "download" });
+  } catch (err) {
+    toast({ msg: `Export failed: ${err.message}`, icon: "alert-triangle", err: true });
+  } finally {
+    _exporting = false;
+    btn.disabled = false;
+    $("#export-progress").hidden = true;
+  }
 });
 
 function showLoading() {
@@ -1110,17 +1392,9 @@ function showError(err) {
     <i data-lucide="cloud-off"></i>
     <h3>${isAbort ? "Request timed out" : "Couldn't reach the OSMSG API"}</h3>
     <p style="margin-top:8px"><code style="font-family:var(--mono);font-size:12px;background:#F4F0E6;padding:2px 6px;border-radius:4px;color:#3A4744">${escapeHtml(msg)}</code></p>
-    <p style="margin-top:14px;color:#717D78">If this is a CORS error and you're hosting this page off the API origin, the API needs to allow your origin. The status pill above will keep retrying when you click it.</p>
+    <p style="margin-top:14px;color:#717D78">If this is a CORS error and you're hosting this page off the API origin, the API needs to allow your origin. Hit Search to try again.</p>
     <p style="margin-top:18px"><a href="${API_BASE}/docs/swagger" target="_blank" rel="noopener">Open the API docs <i data-lucide="external-link" class="ico-sm" style="vertical-align:-2px"></i></a></p>
   </div></td></tr>`;
-  $("#ov-strip").innerHTML = `<div class="tag-stats-empty" style="grid-column:1/-1">·</div>`;
-  $("#ov-breakdown").innerHTML = "";
-  $("#ov-breakdown").hidden = true;
-  $("#ov-breakdown-meta").textContent = "";
-  $("#ov-toggle-btn").setAttribute("aria-expanded", "false");
-  $("#ov-toggle-btn").disabled = true;
-  $("#ov-toggle-label").textContent = "Show tag breakdown";
-  $("#podium").innerHTML = "";
   $("#pagination").hidden = true;
   refreshIcons(tb);
 }
@@ -1151,7 +1425,6 @@ function updateLastUpdated() {
 
 async function fetchHealth() {
   try {
-    fetchEditorStats();
     const res = await fetch(new URL(HEALTH_ENDPOINT, API_BASE), {
       headers: { accept: "application/json" },
       mode: "cors",
@@ -1171,39 +1444,24 @@ async function fetchHealth() {
 }
 
 function renderEditorStats() {
-  renderEditorBarChart();
+  // charts.js is a separate deferred script; guard so an early call (during boot) can't throw.
+  if (typeof renderEditorBarChart === "function") renderEditorBarChart();
 }
 
 async function fetchEditorStats() {
+  if (!state.hashtags.length) { state.editorStats = null; renderEditorStats(); return; }
   try {
-    const url = new URL(EDITOR_STATS_ENDPOINT, EDITOR_STATS_BASE);
-    const { start, end } = rangeWindow(state.range);
-    url.searchParams.set("start", isoUTC(start));
-    url.searchParams.set("end", isoUTC(end));
-    url.searchParams.set("limit", 100);
-
-    const res = await fetch(url, {
-      headers: { accept: "application/json" },
-      mode: "cors",
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-    const json = await res.json();
-    const editors = json.editors || [];
-    const sorted = editors
+    const editors = await apiGet("editors", windowParams(), state.query?.signal);
+    const all = (editors || [])
       .slice()
-      .sort((a, b) => (b.map_changes || 0) - (a.map_changes || 0));
-
-    state.editorStats = {
-      totalEditors: editors.length,
-      top5: sorted.slice(0, 5).map((e) => ({
+      .sort((a, b) => (b.map_changes || 0) - (a.map_changes || 0))
+      .map((e) => ({
         editor: e.editor || "Unknown",
         changes: e.map_changes || 0,
         users: e.users || 0,
         changesets: e.changesets || 0,
-      })),
-    };
-
+      }));
+    state.editorStats = { totalEditors: all.length, all, top5: all.slice(0, 5) };
     renderEditorStats();
   } catch (err) {
     console.warn("Editor stats fetch failed:", err);
@@ -1218,7 +1476,8 @@ function renderWindowBar() {
   const useDate = state.range === "all" || end - start > 60 * 86400 * 1000;
   const f = useDate ? dtfDate : dtfShort;
   $("#wb-window-text").textContent = `${f.format(start)} → ${f.format(end)}`;
-  $("#wb-window").title = `Time window\nUTC: ${start.toISOString()} → ${end.toISOString()}\nLocal (${TZ}): ${dtfFull.format(start)} → ${dtfFull.format(end)}`;
+  $("#wb-window").classList.add("clickable");
+  $("#wb-window").title = `Click to edit this time range\nUTC: ${start.toISOString()} → ${end.toISOString()}`;
   $("#wb-localtime").textContent = dtfClock.format(new Date());
   $("#wb-tzname").textContent = `${TZ} · ${tzOffsetLabel()}`;
 }
@@ -1267,24 +1526,45 @@ if ("serviceWorker" in navigator && location.protocol !== "file:") {
     .catch((err) => console.info("Service worker not registered:", err.message));
 }
 
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopAutoRefresh();
-  else if (state.live) {
-    fetchData({ silent: true });
-    startAutoRefresh();
-  }
-});
-
+function setDetailsOpen(open) {
+  const btn = $("#ov-toggle-btn");
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+  $("#ov-details").hidden = !open;
+  $("#ov-toggle-label").textContent = open ? "Hide details" : "Show details";
+  const caret = btn.querySelector(".ov-caret");
+  if (caret) caret.textContent = open ? "▴" : "▾";
+}
 $("#ov-toggle-btn").addEventListener("click", () => {
   const btn = $("#ov-toggle-btn");
   if (btn.disabled) return;
-  const expanded = btn.getAttribute("aria-expanded") === "true";
-  btn.setAttribute("aria-expanded", expanded ? "false" : "true");
-  $("#ov-details").hidden = expanded;
-  $("#ov-toggle-label").textContent = expanded ? "Show details" : "Hide details";
-  const ico = btn.querySelector('[data-lucide="plus"], [data-lucide="minus"]');
-  if (ico) ico.setAttribute("data-lucide", expanded ? "plus" : "minus");
-  refreshIcons(btn);
+  setDetailsOpen(btn.getAttribute("aria-expanded") !== "true");
+});
+
+// The "Updated" pill doubles as a manual refresh: re-run the active query, or just re-check health
+// when nothing is loaded yet.
+function refreshStats() {
+  if (state.hashtags.length) runQuery();
+  else fetchHealth();
+}
+$("#last-updated")?.addEventListener("click", refreshStats);
+$("#last-updated")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    refreshStats();
+  }
+});
+
+// Clicking the window pill converts the active window (any preset) into an editable custom range and
+// opens the same date picker the Custom button uses.
+$("#wb-window")?.addEventListener("click", () => {
+  const { start, end } =
+    state.windowStart && state.windowEnd
+      ? { start: state.windowStart, end: state.windowEnd }
+      : rangeWindow(state.range);
+  state.customStart = start;
+  state.customEnd = end;
+  setRangePreset("custom");
+  customRangePanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 });
 
 const userModal = $("#user-modal");
@@ -1296,14 +1576,50 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && userModal.classList.contains("open")) closeUserModal();
 });
 
+// Methodology modal: footer link + shareable #methodology deep link.
+const mthModal = $("#methodology-modal");
+function openMethodology() {
+  if (!mthModal) return;
+  mthModal.hidden = false;
+  mthModal.classList.add("open");
+  document.body.style.overflow = "hidden";
+  refreshIcons(mthModal);
+  $("#methodology-close")?.focus();
+  if (location.hash !== "#methodology") history.replaceState(null, "", "#methodology");
+}
+function closeMethodology() {
+  if (!mthModal) return;
+  mthModal.hidden = true;
+  mthModal.classList.remove("open");
+  document.body.style.overflow = "";
+  if (location.hash === "#methodology") history.replaceState(null, "", location.pathname + location.search);
+}
+$("#methodology-link")?.addEventListener("click", (e) => { e.preventDefault(); openMethodology(); });
+$("#methodology-close")?.addEventListener("click", closeMethodology);
+mthModal?.addEventListener("click", (e) => { if (e.target === mthModal) closeMethodology(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && mthModal?.classList.contains("open")) closeMethodology(); });
+window.addEventListener("hashchange", () => { if (location.hash === "#methodology") openMethodology(); });
+if (location.hash === "#methodology") openMethodology();
+
 function boot() {
+  const swaggerURL = `${API_BASE}/docs/swagger`;
+  const apiLink = $("#api-link");
+  if (apiLink) {
+    apiLink.href = swaggerURL;
+    const host = $("#api-host");
+    if (host) host.textContent = new URL(API_BASE).host;
+  }
+  const apiDocsLink = $("#api-docs-link");
+  if (apiDocsLink) apiDocsLink.href = swaggerURL;
   readURL();
   renderChips();
+  renderRecentSearches();
   renderWindowBar();
   refreshIcons();
   fetchHealth();
-  fetchData({});
-  startAutoRefresh();
+  // Submit-driven: only auto-run when the URL already carries a hashtag (shared/bookmarked link).
+  if (state.hashtags.length) runQuery();
+  else showEmptyPrompt();
   state.agoTimer = setInterval(updateLastUpdated, 5000);
   state.clockTimer = setInterval(() => {
     $("#wb-localtime").textContent = dtfClock.format(new Date());
